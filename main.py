@@ -138,7 +138,11 @@ def curve_peak_ratio(L):
 
 
 def regress_fan(train, p1, logh0, lognz, width):
-    """Per-hour OLS log(y_h) ~ logh0 + lognz; returns {h: [q05..q95]} (h=1..23)."""
+    """Per-hour OLS log(y_h) ~ logh0 + lognz; returns {h: [q05..q95]}.
+
+    h is the curve index 1..23, i.e. contest hour h+1 (2..24). Hours with
+    fewer than MIN_ROWS training rows fall back to the persistence fan.
+    """
     fc = {}
     for h in range(1, 24):
         rows = []
