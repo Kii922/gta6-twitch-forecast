@@ -3,22 +3,39 @@
 Model (validated on the 4 practice cases, answers extracted from SullyGnome):
   * Train pool: the case's own comparables with a full release-day curve,
     filtered to "strong anchors" (hour-1 print >= 8% of the day's peak).
-  * Per hour h = 2..24, OLS on log(viewers_h) with two features:
+  * Per hour h = 2..24, weighted OLS on log(viewers_h) with two features:
       log(hour-1 print) and log(nzpeak / hour-1 print), where nzpeak is the
       max hourly viewers in the 24 h before midnight UTC -- the NZ/AU
       unlock wave, which tells how much audience the midnight print
-      understates vs the US wave still to come.
+      understates vs the US wave still to come. Rows are weighted by
+      recency, exp(-(2026 - launch year) / 3): recent launches predict
+      2026 Twitch behaviour better than 2018 ones.
   * Median forecast = 0.8 * regression median + 0.2 * console-only
     median-ratio median (log space). Quantile width = regression residual
-    sd (dof-adjusted, x0.9), normal quantiles at 0.05/0.25/0.5/0.75/0.95.
+    sd (dof-adjusted, x0.85) times a per-band profile (1.0 hours 2-6,
+    0.9 hours 7-13, 0.8 hours 14-24): the fan narrows late in the day,
+    where the residual sd overstates the spread. Residuals are
+    light-tailed vs normal, so a narrower fan scores better throughout.
   * Falls back to the persistence baseline for any hour the fit cannot
     cover (<8 training rows), and to nzratio = 1 when the case has no
     pre-midnight history.
 
 Validation (mean pinball loss, log scale, lower is better):
   house baseline (starter)      0.3871
-  this model, practice cases    0.2049  (p00 0.3328, p01 0.1846, p02 0.1219, p03 0.1803)
-  leave-one-out, console-strong 0.1578  (baseline 0.3226 there)
+  V1 (this repo, submitted)     0.2049 practice / 0.1578 LOO-console /
+                                0.1537 extrap / 0.1319 LOO-console-big
+  V2 (this model)               0.1995 practice (p00 0.329, p01 0.182,
+                                p02 0.111, p03 0.174) / 0.1489 LOO-console /
+                                0.1341 extrap / 0.1054 LOO-console-big /
+                                0.1880 extrap2 (V1: 0.1937). V2 beats V1 on
+                                every metric except LOO-all-strong (0.2536
+                                vs 0.2522, PC launches, least relevant:
+                                the final is console-only).
+  Rejected along the way: pooled-slope model (much worse), KNN fans,
+  channels feature (no data), logjump (helps practice, hurts extrap),
+  Huber, median smoothing, hour-specific blend weights, full empirical
+  fan (wins LOO/extrap but loses practice via the tiny-launch case),
+  ridge+recency stacked (interfere). Full log: gta6-work/v2-experiments.md.
 
 Standard library only. Deterministic: comparables are sorted by name before
 fitting, so repeated runs produce byte-identical output.
@@ -39,7 +56,9 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 W_REG = 0.8          # weight on the regression median in the blend
-WIDTH = 0.9          # multiplier on the regression residual sd
+WIDTH = 0.85         # multiplier on the regression residual sd
+PROFILE = (1.0, 0.9, 0.8)  # width multipliers, hour bands 2-6 / 7-13 / 14-24
+RECENCY_TAU = 3.0    # recency weight exp(-(2026 - year) / tau) per launch
 MIN_ROWS = 8         # minimum training rows per hour for the OLS fit
 STRONG_MIN = 0.08    # hour-1 / day-peak ratio for a "strong anchor"
 
@@ -126,6 +145,7 @@ def build_train(comparables):
             "curve": curve,
             "console_only": "PC" not in comp.get("platforms", ""),
             "nzratio": (nz / curve[0]) if nz else None,
+            "year": int(str(comp.get("day_start", "2024"))[:4]),
         })
     strong = [L for L in launches
               if curve_peak_ratio(L) >= STRONG_MIN]
@@ -138,26 +158,29 @@ def curve_peak_ratio(L):
 
 
 def regress_fan(train, p1, logh0, lognz, width):
-    """Per-hour OLS log(y_h) ~ logh0 + lognz; returns {h: [q05..q95]}.
+    """Per-hour weighted OLS log(y_h) ~ logh0 + lognz; returns {h: [q05..q95]}.
 
-    h is the curve index 1..23, i.e. contest hour h+1 (2..24). Hours with
-    fewer than MIN_ROWS training rows fall back to the persistence fan.
+    Rows are weighted by recency, exp(-(2026 - launch year) / RECENCY_TAU).
+    The residual sd is unweighted (dof-adjusted). h is the curve index
+    1..23, i.e. contest hour h+1 (2..24). Hours with fewer than MIN_ROWS
+    training rows fall back to the persistence fan.
     """
     fc = {}
     for h in range(1, 24):
         rows = []
         for L in train:
             if h in L["curve"] and L["curve"][h] > 0 and L.get("nzratio"):
+                w = math.exp(-(2026 - L.get("year", 2024)) / RECENCY_TAU)
                 rows.append(([1.0, math.log(max(L["curve"][0], 1)),
                               math.log(max(L["nzratio"], 1e-6))],
-                             math.log(L["curve"][h])))
+                             math.log(L["curve"][h]), w))
         if len(rows) < MIN_ROWS:
             fc[h] = baseline_quantiles(p1, h)
             continue
         k = 3
         n = len(rows)
-        A = [[sum(r[0][a] * r[0][b] for r in rows) for b in range(k)] for a in range(k)]
-        bv = [sum(r[0][a] * r[1] for r in rows) for a in range(k)]
+        A = [[sum(r[2] * r[0][a] * r[0][b] for r in rows) for b in range(k)] for a in range(k)]
+        bv = [sum(r[2] * r[0][a] * r[1] for r in rows) for a in range(k)]
         beta = solve(A, bv)
         res = [r[1] - sum(beta[j] * r[0][j] for j in range(k)) for r in rows]
         sd = max(math.sqrt(sum(x * x for x in res) / max(n - k, 1)), 0.05) * width
@@ -208,6 +231,8 @@ def forecast_case(case):
         h = row["hour"] - 1  # curve index 1..23
         med = W_REG * math.log(reg[h][2]) + (1 - W_REG) * math.log(con[h][2])
         sd = (math.log(reg[h][3]) - math.log(reg[h][1])) / (2 * 0.674)
+        band = 0 if h <= 5 else (1 if h <= 12 else 2)
+        sd *= PROFILE[band]
         qs = [round2(max(1.0, math.exp(med + z * sd))) for z in Z]
         # keep the row non-decreasing and within bounds after rounding
         qs = [max(1, min(1e9, q)) for q in qs]
